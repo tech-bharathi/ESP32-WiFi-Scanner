@@ -1,0 +1,374 @@
+#include <WiFi.h>
+#include <U8g2lib.h>
+#include <Wire.h>
+#include <mbedtls/aes.h>
+#include <mbedtls/md.h>
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// ══════════════════════════════════════════════════════
+//  AES-256 KEY & IV
+// ══════════════════════════════════════════════════════
+const uint8_t AES_KEY[32] = {
+  0x43,0x79,0x62,0x65,0x72,0x5A,0x65,0x65,
+  0x42,0x68,0x61,0x72,0x61,0x74,0x68,0x69,
+  0x4D,0x53,0x65,0x63,0x75,0x72,0x65,0x4B,
+  0x65,0x79,0x32,0x30,0x32,0x35,0x58,0x58
+};
+const uint8_t AES_IV[16] = {
+  0x49,0x56,0x43,0x79,0x62,0x65,0x72,0x5A,
+  0x65,0x65,0x30,0x31,0x32,0x33,0x34,0x35
+};
+
+// ══════════════════════════════════════════════════════
+//  WIFI SYMBOL — drawn with primitives, never a bitmap
+//  cx,cy = center of the dot
+// ══════════════════════════════════════════════════════
+void drawWiFi(uint8_t cx, uint8_t cy) {
+  u8g2.drawDisc(cx, cy, 3);
+  u8g2.drawCircle(cx, cy - 6,  8,  U8G2_DRAW_UPPER_LEFT | U8G2_DRAW_UPPER_RIGHT);
+  u8g2.drawCircle(cx, cy - 6,  13, U8G2_DRAW_UPPER_LEFT | U8G2_DRAW_UPPER_RIGHT);
+  u8g2.drawCircle(cx, cy - 6,  18, U8G2_DRAW_UPPER_LEFT | U8G2_DRAW_UPPER_RIGHT);
+}
+
+// ══════════════════════════════════════════════════════
+//  SCREEN 1 & 2 — SPLASH
+//
+//  ┌──────────────────────────────────┐
+//  │  (WiFi)  │  line1               │
+//  │  (Logo)  │  line2               │
+//  │          │  line3 (small)       │
+//  └──────────────────────────────────┘
+// ══════════════════════════════════════════════════════
+void screenSplash(const char* l1, const char* l2, const char* l3) {
+  u8g2.clearBuffer();
+  u8g2.drawFrame(0, 0, 128, 64);
+  drawWiFi(22, 46);
+  u8g2.drawVLine(46, 4, 56);
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(50, 18, l1);
+  u8g2.drawStr(50, 32, l2);
+  u8g2.setFont(u8g2_font_5x8_tf);
+  u8g2.drawStr(50, 50, l3);
+  u8g2.sendBuffer();
+}
+
+// ══════════════════════════════════════════════════════
+//  SCREEN 3 — SCANNING
+//
+//  ┌──────────────────────────────────┐
+//  │         (WiFi logo)              │
+//  │ ──────────────────────────────── │
+//  │  Scanning . . .                  │
+//  │  Please wait...                  │
+//  └──────────────────────────────────┘
+// ══════════════════════════════════════════════════════
+void screenScanning(uint8_t dotCount) {
+  u8g2.clearBuffer();
+  u8g2.drawFrame(0, 0, 128, 64);
+  drawWiFi(64, 28);
+  u8g2.drawHLine(4, 36, 120);
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(4, 50, "Scanning");
+  for (uint8_t d = 0; d < dotCount; d++)
+    u8g2.drawStr(54 + d * 7, 50, ".");
+  u8g2.setFont(u8g2_font_5x8_tf);
+  u8g2.drawStr(18, 62, "Please wait...");
+  u8g2.sendBuffer();
+}
+
+// ══════════════════════════════════════════════════════
+//  SCREEN 4 — RESULT  (pixel-exact for 128x64)
+//
+//  ┌──────────────────────────────────┐  y=0
+//  │ [INVERTED] 1/30  NetworkName     │  y=0–13
+//  │──────────────────────────────────│  y=14
+//  │ Sig : -75 dBm                    │  y=25
+//  │ CH  : 11                         │  y=35
+//  │ MAC : FE:CF:74:80:3F:xx          │  y=45
+//  │ [E2E] WPA2                       │  y=57
+//  └──────────────────────────────────┘  y=63
+// ══════════════════════════════════════════════════════
+void screenResult(uint8_t idx, uint8_t total,
+                  String ssid, int rssi,
+                  uint8_t ch, String mac, String enc) {
+  u8g2.clearBuffer();
+
+  // ── Inverted header bar ────────────────────────────
+  u8g2.setDrawColor(1);
+  u8g2.drawBox(0, 0, 128, 13);
+  u8g2.setDrawColor(0);               // black text on white bar
+  u8g2.setFont(u8g2_font_5x8_tf);
+
+  // Build index string e.g. "1/30 "
+  char idx_str[8];
+  snprintf(idx_str, sizeof(idx_str), "%d/%d ", idx, total);
+
+  // Calculate how many SSID chars fit in remaining width
+  // Total usable = 124px (2px padding each side)
+  // Index uses: strlen(idx_str) * 5 px
+  int used     = strlen(idx_str) * 5;
+  int ssid_max = (124 - used) / 5;
+  if (ssid_max < 0)  ssid_max = 0;
+  if (ssid_max > 20) ssid_max = 20;
+
+  String ssidTrim = (ssid.length() > (unsigned)ssid_max)
+                    ? ssid.substring(0, ssid_max)
+                    : ssid;
+
+  char hdr[28];
+  snprintf(hdr, sizeof(hdr), "%s%s", idx_str, ssidTrim.c_str());
+  u8g2.drawStr(2, 10, hdr);
+
+  u8g2.setDrawColor(1);               // restore white drawing
+
+  // ── Divider ───────────────────────────────────────
+  u8g2.drawHLine(0, 14, 128);
+
+  // ── Data rows (font_5x8: 5px wide × 8px tall) ────
+  u8g2.setFont(u8g2_font_5x8_tf);
+  char buf[28];
+
+  // Row 1 — Signal strength
+  snprintf(buf, sizeof(buf), "Sig : %d dBm", rssi);
+  u8g2.drawStr(2, 25, buf);
+
+  // Row 2 — Channel
+  snprintf(buf, sizeof(buf), "CH  : %d", ch);
+  u8g2.drawStr(2, 35, buf);
+
+  // Row 3 — MAC address
+  // "MAC : " (6) + MAC (17) = 23 chars × 5px = 115px < 126px ✓
+  String macSafe = (mac.length() > 17) ? mac.substring(0, 17) : mac;
+  snprintf(buf, sizeof(buf), "MAC : %s", macSafe.c_str());
+  u8g2.drawStr(2, 45, buf);
+
+  // Row 4 — E2E encryption type
+  // "[E2E] " (6) + enc (max 9) = 15 chars × 5px = 75px < 126px ✓
+  String encSafe = (enc.length() > 9) ? enc.substring(0, 9) : enc;
+  snprintf(buf, sizeof(buf), "[E2E] %s", encSafe.c_str());
+  u8g2.drawStr(2, 57, buf);
+
+  u8g2.sendBuffer();
+}
+
+// ══════════════════════════════════════════════════════
+//  SCREEN 5 — NO NETWORKS
+// ══════════════════════════════════════════════════════
+void screenNoNetwork() {
+  u8g2.clearBuffer();
+  u8g2.drawFrame(0, 0, 128, 64);
+  drawWiFi(64, 32);
+  // Bold X cross over logo
+  u8g2.drawLine(48, 10, 80, 42);
+  u8g2.drawLine(49, 10, 81, 42);
+  u8g2.drawLine(80, 10, 48, 42);
+  u8g2.drawLine(81, 10, 49, 42);
+  u8g2.drawHLine(4, 46, 120);
+  u8g2.setFont(u8g2_font_5x8_tf);
+  u8g2.drawStr(12, 58, "No Networks Found");
+  u8g2.sendBuffer();
+}
+
+// ══════════════════════════════════════════════════════
+//  AES-CBC ENCRYPT
+// ══════════════════════════════════════════════════════
+String encryptAES(String plainText) {
+  uint8_t iv[16];
+  memcpy(iv, AES_IV, 16);
+  int len      = plainText.length();
+  int padLen   = 16 - (len % 16);
+  int totalLen = len + padLen;
+  uint8_t* in  = new uint8_t[totalLen];
+  uint8_t* out = new uint8_t[totalLen];
+  memcpy(in, plainText.c_str(), len);
+  memset(in + len, padLen, padLen);
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  mbedtls_aes_setkey_enc(&aes, AES_KEY, 256);
+  mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, totalLen, iv, in, out);
+  mbedtls_aes_free(&aes);
+  String r = "";
+  for (int i = 0; i < totalLen; i++) {
+    char h[3];
+    snprintf(h, sizeof(h), "%02X", out[i]);
+    r += h;
+  }
+  delete[] in;
+  delete[] out;
+  return r;
+}
+
+// ══════════════════════════════════════════════════════
+//  AES-CBC DECRYPT
+// ══════════════════════════════════════════════════════
+String decryptAES(String hexCipher) {
+  uint8_t iv[16];
+  memcpy(iv, AES_IV, 16);
+  int totalLen = hexCipher.length() / 2;
+  uint8_t* in  = new uint8_t[totalLen];
+  uint8_t* out = new uint8_t[totalLen + 1];
+  for (int i = 0; i < totalLen; i++)
+    in[i] = (uint8_t)strtol(
+      hexCipher.substring(i * 2, i * 2 + 2).c_str(), NULL, 16);
+  mbedtls_aes_context aes;
+  mbedtls_aes_init(&aes);
+  mbedtls_aes_setkey_dec(&aes, AES_KEY, 256);
+  mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, totalLen, iv, in, out);
+  mbedtls_aes_free(&aes);
+  uint8_t padLen = out[totalLen - 1];
+  out[totalLen - padLen] = '\0';
+  String r = String((char*)out);
+  delete[] in;
+  delete[] out;
+  return r;
+}
+
+// ══════════════════════════════════════════════════════
+//  HMAC-SHA256
+// ══════════════════════════════════════════════════════
+String generateHMAC(String data) {
+  uint8_t hmac[32];
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+  mbedtls_md_hmac_starts(&ctx, AES_KEY, 32);
+  mbedtls_md_hmac_update(&ctx, (const uint8_t*)data.c_str(), data.length());
+  mbedtls_md_hmac_finish(&ctx, hmac);
+  mbedtls_md_free(&ctx);
+  String r = "";
+  for (int i = 0; i < 32; i++) {
+    char h[3];
+    snprintf(h, sizeof(h), "%02X", hmac[i]);
+    r += h;
+  }
+  return r;
+}
+
+// ══════════════════════════════════════════════════════
+//  BUILD PAYLOAD
+// ══════════════════════════════════════════════════════
+String buildPayload(int i, String enc) {
+  char p[256];
+  snprintf(p, sizeof(p),
+    "SSID:%s|RSSI:%d|CH:%d|MAC:%s|ENC:%s",
+    WiFi.SSID(i).c_str(),
+    WiFi.RSSI(i),
+    WiFi.channel(i),
+    WiFi.BSSIDstr(i).c_str(),
+    enc.c_str());
+  return String(p);
+}
+
+// ══════════════════════════════════════════════════════
+//  SETUP
+// ══════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  u8g2.begin();
+
+  // Welcome screen
+  screenSplash("Welcome To", "CyberZee", "Author:Bharathi.M");
+  delay(3000);
+
+  // Initializing screen
+  screenSplash("WiFi", "Scanner", "Initializing...");
+  delay(1500);
+
+  // Scanning animation
+  for (int f = 0; f < 9; f++) {
+    screenScanning((f % 3) + 1);
+    delay(350);
+  }
+}
+
+// ══════════════════════════════════════════════════════
+//  LOOP
+// ══════════════════════════════════════════════════════
+void loop() {
+  // Scanning animation
+  for (int f = 0; f < 9; f++) {
+    screenScanning((f % 3) + 1);
+    delay(350);
+  }
+
+  int n = WiFi.scanNetworks();
+
+  if (n == 0) {
+    screenNoNetwork();
+    Serial.println("+---------------------------+");
+    Serial.println("|    No Networks Found      |");
+    Serial.println("+---------------------------+");
+    delay(3000);
+    return;
+  }
+
+  Serial.println("+--------------------------------------------+");
+  Serial.println("|           Networks Found                   |");
+  Serial.println("+--------------------------------------------+");
+
+  for (int i = 0; i < n; i++) {
+
+    // Resolve encryption type
+    String encType;
+    switch (WiFi.encryptionType(i)) {
+      case WIFI_AUTH_OPEN:            encType = "Open";     break;
+      case WIFI_AUTH_WEP:             encType = "WEP";      break;
+      case WIFI_AUTH_WPA_PSK:         encType = "WPA";      break;
+      case WIFI_AUTH_WPA2_PSK:        encType = "WPA2";     break;
+      case WIFI_AUTH_WPA_WPA2_PSK:    encType = "WPA+WPA2"; break;
+      case WIFI_AUTH_WPA2_ENTERPRISE: encType = "WPA2-ENT"; break;
+      case WIFI_AUTH_WPA3_PSK:        encType = "WPA3";     break;
+      default:                        encType = "Unknown";  break;
+    }
+
+    // Encrypt, HMAC, Decrypt
+    String payload   = buildPayload(i, encType);
+    String encrypted = encryptAES(payload);
+    String hmac      = generateHMAC(encrypted);
+    String decrypted = decryptAES(encrypted);
+
+    // OLED result — 2 seconds per network
+    screenResult(
+      i + 1, n,
+      WiFi.SSID(i),
+      WiFi.RSSI(i),
+      (uint8_t)WiFi.channel(i),
+      WiFi.BSSIDstr(i),
+      encType
+    );
+    delay(2000);
+
+    // Serial output
+    char row[64];
+    Serial.println("+--------------------------------------------+");
+    snprintf(row, sizeof(row), "| Name       : %-28s |", WiFi.SSID(i).c_str());
+    Serial.println(row);
+    snprintf(row, sizeof(row), "| Signal     : %-4d dBm                    |", WiFi.RSSI(i));
+    Serial.println(row);
+    snprintf(row, sizeof(row), "| Channel    : %-28d |", WiFi.channel(i));
+    Serial.println(row);
+    snprintf(row, sizeof(row), "| MAC Addr   : %-28s |", WiFi.BSSIDstr(i).c_str());
+    Serial.println(row);
+    snprintf(row, sizeof(row), "| Encryption : %-28s |", encType.c_str());
+    Serial.println(row);
+    Serial.println("+--------------------------------------------+");
+    Serial.println("| [E2E ENCRYPTED PAYLOAD]                    |");
+    Serial.println("+--------------------------------------------+");
+    Serial.println(encrypted);
+    Serial.println("+--------------------------------------------+");
+    Serial.println("| [HMAC-SHA256 INTEGRITY]                    |");
+    Serial.println("+--------------------------------------------+");
+    Serial.println(hmac);
+    Serial.println("+--------------------------------------------+");
+    Serial.println("| [DECRYPTED & VERIFIED]                     |");
+    Serial.println("+--------------------------------------------+");
+    Serial.println(decrypted);
+    Serial.println("+--------------------------------------------+");
+    Serial.println();
+  }
+
+  delay(3000);
+}
